@@ -2160,8 +2160,6 @@ Ensure only one `zeroclaw` process is using this bot token."
         }
     }
 
-        }
-    }
 
     async fn health_check(&self) -> bool {
         let timeout_duration = Duration::from_secs(5);
