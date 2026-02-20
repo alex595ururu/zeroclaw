@@ -15,6 +15,13 @@ use tokio::fs;
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 
+/// Default Whisper API URL for transcription (can be overridden via environment variable)
+const DEFAULT_WHISPER_API_URL: &str = "http://127.0.0.1:8318/transcribe";
+
+/// Maximum file size for downloads (20MB)
+const MAX_DOWNLOAD_SIZE: usize = 20 * 1024 * 1024;
+
+
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
 fn split_message_for_telegram(message: &str) -> Vec<String> {
