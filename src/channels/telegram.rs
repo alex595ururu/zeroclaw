@@ -96,8 +96,9 @@ impl TelegramAttachmentKind {
         }
     }
 }
-
 fn is_http_url(target: &str) -> bool {
+    target.starts_with("http://") || target.starts_with("https://")
+}
 
 /// Represents an incoming attachment from Telegram (voice, document, photo, video, audio).
 #[derive(Debug, Clone)]
