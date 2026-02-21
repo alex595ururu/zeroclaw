@@ -125,8 +125,6 @@ enum IncomingAttachment {
     },
 }
 
-    target.starts_with("http://") || target.starts_with("https://")
-}
 
 fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
     let normalized = target
