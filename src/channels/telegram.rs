@@ -110,6 +110,7 @@ enum IncomingAttachment {
     Audio {
         file_id: String,
         file_name: String,
+        mime_type: Option<String>,
     },
     Document {
         file_id: String,
@@ -123,6 +124,21 @@ enum IncomingAttachment {
         file_id: String,
         duration: i64,
     },
+}
+
+fn infer_audio_content_type(file_name: Option<&str>, fallback: &str) -> String {
+    let ext = file_name
+        .and_then(|name| Path::new(name).extension().and_then(|e| e.to_str()))
+        .map(|e| e.to_ascii_lowercase());
+
+    match ext.as_deref() {
+        Some("ogg") | Some("oga") | Some("opus") => "audio/ogg".to_string(),
+        Some("mp3") => "audio/mpeg".to_string(),
+        Some("m4a") => "audio/mp4".to_string(),
+        Some("wav") => "audio/wav".to_string(),
+        Some("flac") => "audio/flac".to_string(),
+        _ => fallback.to_string(),
+    }
 }
 
 
@@ -535,18 +551,30 @@ impl TelegramChannel {
     }
 
 
-    /// Transcribe audio bytes using local Whisper API.
-    async fn transcribe_audio(&self, audio_bytes: Vec<u8>) -> String {
+    /// Transcribe audio bytes using Whisper-compatible endpoint.
+    ///
+    /// Tries two request formats for compatibility:
+    /// 1) Raw bytes body with `Content-Type: audio/*`
+    /// 2) Multipart form (`file`, `model`, optional `language`)
+    async fn transcribe_audio(
+        &self,
+        audio_bytes: Vec<u8>,
+        content_type: &str,
+        file_name: &str,
+    ) -> String {
         let whisper_url = std::env::var("WHISPER_API_URL")
             .unwrap_or_else(|_| DEFAULT_WHISPER_API_URL.to_string());
+        let whisper_language = std::env::var("WHISPER_LANGUAGE").ok();
+        let whisper_model = std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "whisper-1".to_string());
 
         let client = self.http_client();
-        
+
+        // 1) Raw body mode (existing behavior, now with accurate content type)
         match client
             .post(&whisper_url)
-            .header("Content-Type", "audio/wav")
-            .header("X-Language", "ru")
-            .body(audio_bytes)
+            .header("Content-Type", content_type)
+            .header("X-Filename", file_name)
+            .body(audio_bytes.clone())
             .send()
             .await
         {
@@ -554,24 +582,62 @@ impl TelegramChannel {
                 match resp.json::<serde_json::Value>().await {
                     Ok(data) => {
                         if let Some(text) = data.get("text").and_then(|t| t.as_str()) {
-                            if data.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
+                            if data.get("success").and_then(|s| s.as_bool()).unwrap_or(true) {
                                 return text.to_string();
                             }
                         }
-                        "[Transcription failed: invalid response]".to_string()
+                        tracing::warn!("Whisper raw response missing text/success shape");
                     }
                     Err(e) => {
                         tracing::error!("Failed to parse Whisper response: {}", e);
-                        "[Transcription failed: parse error]".to_string()
                     }
                 }
             }
             Ok(resp) => {
-                tracing::warn!("Whisper API returned status {}", resp.status());
+                tracing::warn!("Whisper raw API returned status {}", resp.status());
+            }
+            Err(e) => {
+                tracing::error!("Failed to call Whisper raw API: {}", e);
+            }
+        }
+
+        // 2) Multipart fallback (OpenAI-compatible transcription APIs)
+        let mut form = Form::new().text("model", whisper_model);
+        if let Some(language) = whisper_language.filter(|lang| !lang.trim().is_empty()) {
+            form = form.text("language", language);
+        }
+
+        let part = match Part::bytes(audio_bytes)
+            .file_name(file_name.to_string())
+            .mime_str(content_type)
+        {
+            Ok(part) => part,
+            Err(e) => {
+                tracing::error!("Failed to build multipart audio part: {}", e);
+                return "[Transcription failed: invalid audio mime]".to_string();
+            }
+        };
+        form = form.part("file", part);
+
+        match client.post(&whisper_url).multipart(form).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+                Ok(data) => {
+                    if let Some(text) = data.get("text").and_then(|t| t.as_str()) {
+                        return text.to_string();
+                    }
+                    "[Transcription failed: invalid response]".to_string()
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse Whisper multipart response: {}", e);
+                    "[Transcription failed: parse error]".to_string()
+                }
+            },
+            Ok(resp) => {
+                tracing::warn!("Whisper multipart API returned status {}", resp.status());
                 format!("[Transcription failed: HTTP {}]", resp.status())
             }
             Err(e) => {
-                tracing::error!("Failed to call Whisper API: {}", e);
+                tracing::error!("Failed to call Whisper multipart API: {}", e);
                 "[Transcription failed: API error]".to_string()
             }
         }
@@ -600,7 +666,15 @@ impl TelegramChannel {
         if let Some(audio) = message.get("audio") {
             let file_id = audio.get("file_id")?.as_str()?.to_string();
             let file_name = audio.get("file_name").and_then(|n| n.as_str()).unwrap_or("audio").to_string();
-            return Some(IncomingAttachment::Audio { file_id, file_name });
+            let mime_type = audio
+                .get("mime_type")
+                .and_then(|m| m.as_str())
+                .map(|m| m.to_string());
+            return Some(IncomingAttachment::Audio {
+                file_id,
+                file_name,
+                mime_type,
+            });
         }
 
         if let Some(document) = message.get("document") {
@@ -632,7 +706,10 @@ impl TelegramChannel {
                 tracing::info!("Processing voice message: duration={}s", duration);
                 match self.download_telegram_file(&file_id).await {
                     Some(audio_bytes) => {
-                        let transcription = self.transcribe_audio(audio_bytes).await;
+                        let content_type = infer_audio_content_type(Some("voice.ogg"), "audio/ogg");
+                        let transcription = self
+                            .transcribe_audio(audio_bytes, &content_type, "voice.ogg")
+                            .await;
                         if transcription.starts_with('[') {
                             format!("[Voice message, {}s - transcription failed] {}", duration, transcription)
                         } else {
@@ -644,11 +721,22 @@ impl TelegramChannel {
                 }
             }
             
-            IncomingAttachment::Audio { file_id, file_name } => {
+            IncomingAttachment::Audio {
+                file_id,
+                file_name,
+                mime_type,
+            } => {
                 tracing::info!("Processing audio file: {}", file_name);
                 match self.download_telegram_file(&file_id).await {
                     Some(audio_bytes) => {
-                        let transcription = self.transcribe_audio(audio_bytes).await;
+                        let fallback = infer_audio_content_type(Some(&file_name), "audio/mpeg");
+                        let content_type = mime_type
+                            .as_deref()
+                            .map(|m| m.to_string())
+                            .unwrap_or(fallback);
+                        let transcription = self
+                            .transcribe_audio(audio_bytes, &content_type, &file_name)
+                            .await;
                         if transcription.starts_with('[') {
                             format!("[Audio file: {} - transcription failed] {}", file_name, transcription)
                         } else {
@@ -2485,6 +2573,31 @@ mod tests {
             infer_attachment_kind_from_target("https://example.com/files/specs.pdf?download=1"),
             Some(TelegramAttachmentKind::Document)
         );
+    }
+
+    #[test]
+    fn infer_audio_content_type_by_extension() {
+        assert_eq!(
+            infer_audio_content_type(Some("voice.ogg"), "audio/wav"),
+            "audio/ogg"
+        );
+        assert_eq!(
+            infer_audio_content_type(Some("music.mp3"), "audio/wav"),
+            "audio/mpeg"
+        );
+        assert_eq!(
+            infer_audio_content_type(Some("recording.flac"), "audio/wav"),
+            "audio/flac"
+        );
+    }
+
+    #[test]
+    fn infer_audio_content_type_uses_fallback_for_unknown_extension() {
+        assert_eq!(
+            infer_audio_content_type(Some("blob.bin"), "audio/wav"),
+            "audio/wav"
+        );
+        assert_eq!(infer_audio_content_type(None, "audio/ogg"), "audio/ogg");
     }
 
     #[test]
