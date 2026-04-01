@@ -15,6 +15,13 @@ use tokio::fs;
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 
+/// Default Whisper API URL for transcription (can be overridden via environment variable)
+const DEFAULT_WHISPER_API_URL: &str = "http://127.0.0.1:8318/transcribe";
+
+/// Maximum file size for downloads (20MB)
+const MAX_DOWNLOAD_SIZE: usize = 20 * 1024 * 1024;
+
+
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
 fn split_message_for_telegram(message: &str) -> Vec<String> {
@@ -89,10 +96,51 @@ impl TelegramAttachmentKind {
         }
     }
 }
-
 fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
+
+/// Represents an incoming attachment from Telegram (voice, document, photo, video, audio).
+#[derive(Debug, Clone)]
+enum IncomingAttachment {
+    Voice {
+        file_id: String,
+        duration: i64,
+    },
+    Audio {
+        file_id: String,
+        file_name: String,
+        mime_type: Option<String>,
+    },
+    Document {
+        file_id: String,
+        file_name: String,
+        mime_type: String,
+    },
+    Photo {
+        file_id: String,
+    },
+    Video {
+        file_id: String,
+        duration: i64,
+    },
+}
+
+fn infer_audio_content_type(file_name: Option<&str>, fallback: &str) -> String {
+    let ext = file_name
+        .and_then(|name| Path::new(name).extension().and_then(|e| e.to_str()))
+        .map(|e| e.to_ascii_lowercase());
+
+    match ext.as_deref() {
+        Some("ogg") | Some("oga") | Some("opus") => "audio/ogg".to_string(),
+        Some("mp3") => "audio/mpeg".to_string(),
+        Some("m4a") => "audio/mp4".to_string(),
+        Some("wav") => "audio/wav".to_string(),
+        Some("flac") => "audio/flac".to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
 
 fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
     let normalized = target
@@ -450,6 +498,383 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("https://api.telegram.org/bot{}/{method}", self.bot_token)
+    }
+
+
+    // ============================================================
+    // INCOMING ATTACHMENT HANDLING (Voice, Document, Photo, Video, Audio)
+    // ============================================================
+
+    /// Get the download URL for a Telegram file by file_id.
+    async fn get_telegram_file_url(&self, file_id: &str) -> Option<String> {
+        let resp = self
+            .http_client()
+            .get(self.api_url("getFile"))
+            .query(&[("file_id", file_id)])
+            .send()
+            .await
+            .ok()?;
+
+        if !resp.status().is_success() {
+            tracing::warn!("Telegram getFile API error for file_id={}", file_id);
+            return None;
+        }
+
+        let data: serde_json::Value = resp.json().await.ok()?;
+        let file_path = data.get("result")?.get("file_path")?.as_str()?;
+
+        Some(format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.bot_token, file_path
+        ))
+    }
+
+    /// Download a file from Telegram by file_id.
+    async fn download_telegram_file(&self, file_id: &str) -> Option<Vec<u8>> {
+        let file_url = self.get_telegram_file_url(file_id).await?;
+        let resp = self.http_client().get(&file_url).send().await.ok()?;
+
+        if let Some(content_length) = resp.content_length() {
+            if content_length as usize > MAX_DOWNLOAD_SIZE {
+                tracing::warn!("Telegram file too large: {} bytes", content_length);
+                return None;
+            }
+        }
+
+        let bytes = resp.bytes().await.ok()?;
+        if bytes.len() > MAX_DOWNLOAD_SIZE {
+            tracing::warn!("Telegram file too large after download: {} bytes", bytes.len());
+            return None;
+        }
+
+        Some(bytes.to_vec())
+    }
+
+
+    /// Transcribe audio bytes using Whisper-compatible endpoint.
+    ///
+    /// Tries two request formats for compatibility:
+    /// 1) Raw bytes body with `Content-Type: audio/*`
+    /// 2) Multipart form (`file`, `model`, optional `language`)
+    async fn transcribe_audio(
+        &self,
+        audio_bytes: Vec<u8>,
+        content_type: &str,
+        file_name: &str,
+    ) -> String {
+        let whisper_url = std::env::var("WHISPER_API_URL")
+            .unwrap_or_else(|_| DEFAULT_WHISPER_API_URL.to_string());
+        let whisper_language = std::env::var("WHISPER_LANGUAGE").ok();
+        let whisper_model = std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "whisper-1".to_string());
+
+        let client = self.http_client();
+
+        // 1) Raw body mode (existing behavior, now with accurate content type)
+        match client
+            .post(&whisper_url)
+            .header("Content-Type", content_type)
+            .header("X-Filename", file_name)
+            .body(audio_bytes.clone())
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        if let Some(text) = data.get("text").and_then(|t| t.as_str()) {
+                            if data.get("success").and_then(|s| s.as_bool()).unwrap_or(true) {
+                                return text.to_string();
+                            }
+                        }
+                        tracing::warn!("Whisper raw response missing text/success shape");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to parse Whisper response: {}", e);
+                    }
+                }
+            }
+            Ok(resp) => {
+                tracing::warn!("Whisper raw API returned status {}", resp.status());
+            }
+            Err(e) => {
+                tracing::error!("Failed to call Whisper raw API: {}", e);
+            }
+        }
+
+        // 2) Multipart fallback (OpenAI-compatible transcription APIs)
+        let mut form = Form::new().text("model", whisper_model);
+        if let Some(language) = whisper_language.filter(|lang| !lang.trim().is_empty()) {
+            form = form.text("language", language);
+        }
+
+        let part = match Part::bytes(audio_bytes)
+            .file_name(file_name.to_string())
+            .mime_str(content_type)
+        {
+            Ok(part) => part,
+            Err(e) => {
+                tracing::error!("Failed to build multipart audio part: {}", e);
+                return "[Transcription failed: invalid audio mime]".to_string();
+            }
+        };
+        form = form.part("file", part);
+
+        match client.post(&whisper_url).multipart(form).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+                Ok(data) => {
+                    if let Some(text) = data.get("text").and_then(|t| t.as_str()) {
+                        return text.to_string();
+                    }
+                    "[Transcription failed: invalid response]".to_string()
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse Whisper multipart response: {}", e);
+                    "[Transcription failed: parse error]".to_string()
+                }
+            },
+            Ok(resp) => {
+                tracing::warn!("Whisper multipart API returned status {}", resp.status());
+                format!("[Transcription failed: HTTP {}]", resp.status())
+            }
+            Err(e) => {
+                tracing::error!("Failed to call Whisper multipart API: {}", e);
+                "[Transcription failed: API error]".to_string()
+            }
+        }
+    }
+
+
+    /// Extract caption text from message if available.
+    fn get_message_caption(message: &serde_json::Value) -> Option<String> {
+        message.get("caption").and_then(|c| c.as_str()).map(|s| s.to_string())
+    }
+
+    /// Get the file_id of the largest photo variant.
+    fn get_photo_file_id(photo_array: &serde_json::Value) -> Option<String> {
+        let photos = photo_array.as_array()?;
+        photos.last()?.get("file_id")?.as_str().map(|s| s.to_string())
+    }
+
+    /// Check if message contains an incoming attachment.
+    fn extract_incoming_attachment(message: &serde_json::Value) -> Option<IncomingAttachment> {
+        if let Some(voice) = message.get("voice") {
+            let file_id = voice.get("file_id")?.as_str()?.to_string();
+            let duration = voice.get("duration").and_then(|d| d.as_i64()).unwrap_or(0);
+            return Some(IncomingAttachment::Voice { file_id, duration });
+        }
+
+        if let Some(audio) = message.get("audio") {
+            let file_id = audio.get("file_id")?.as_str()?.to_string();
+            let file_name = audio.get("file_name").and_then(|n| n.as_str()).unwrap_or("audio").to_string();
+            let mime_type = audio
+                .get("mime_type")
+                .and_then(|m| m.as_str())
+                .map(|m| m.to_string());
+            return Some(IncomingAttachment::Audio {
+                file_id,
+                file_name,
+                mime_type,
+            });
+        }
+
+        if let Some(document) = message.get("document") {
+            let file_id = document.get("file_id")?.as_str()?.to_string();
+            let file_name = document.get("file_name").and_then(|n| n.as_str()).unwrap_or("document").to_string();
+            let mime_type = document.get("mime_type").and_then(|m| m.as_str()).unwrap_or("").to_string();
+            return Some(IncomingAttachment::Document { file_id, file_name, mime_type });
+        }
+
+        if let Some(photo) = message.get("photo") {
+            let file_id = Self::get_photo_file_id(photo)?;
+            return Some(IncomingAttachment::Photo { file_id });
+        }
+
+        if let Some(video) = message.get("video") {
+            let file_id = video.get("file_id")?.as_str()?.to_string();
+            let duration = video.get("duration").and_then(|d| d.as_i64()).unwrap_or(0);
+            return Some(IncomingAttachment::Video { file_id, duration });
+        }
+
+        None
+    }
+
+
+    /// Process incoming attachment and return text representation.
+    async fn process_incoming_attachment(&self, attachment: IncomingAttachment, caption: Option<String>) -> String {
+        match attachment {
+            IncomingAttachment::Voice { file_id, duration } => {
+                tracing::info!("Processing voice message: duration={}s", duration);
+                match self.download_telegram_file(&file_id).await {
+                    Some(audio_bytes) => {
+                        let content_type = infer_audio_content_type(Some("voice.ogg"), "audio/ogg");
+                        let transcription = self
+                            .transcribe_audio(audio_bytes, &content_type, "voice.ogg")
+                            .await;
+                        if transcription.starts_with('[') {
+                            format!("[Voice message, {}s - transcription failed] {}", duration, transcription)
+                        } else {
+                            let caption_part = caption.map(|c| format!(" \"{}\"", c)).unwrap_or_default();
+                            format!("[Voice message, {}s]{} {}", duration, caption_part, transcription)
+                        }
+                    }
+                    None => format!("[Voice message, {}s - download failed]", duration)
+                }
+            }
+            
+            IncomingAttachment::Audio {
+                file_id,
+                file_name,
+                mime_type,
+            } => {
+                tracing::info!("Processing audio file: {}", file_name);
+                match self.download_telegram_file(&file_id).await {
+                    Some(audio_bytes) => {
+                        let fallback = infer_audio_content_type(Some(&file_name), "audio/mpeg");
+                        let content_type = mime_type
+                            .as_deref()
+                            .map(|m| m.to_string())
+                            .unwrap_or(fallback);
+                        let transcription = self
+                            .transcribe_audio(audio_bytes, &content_type, &file_name)
+                            .await;
+                        if transcription.starts_with('[') {
+                            format!("[Audio file: {} - transcription failed] {}", file_name, transcription)
+                        } else {
+                            format!("[Audio file: {}] {}", file_name, transcription)
+                        }
+                    }
+                    None => format!("[Audio file: {} - download failed]", file_name)
+                }
+            }
+            
+            IncomingAttachment::Document { file_id, file_name, mime_type } => {
+                tracing::info!("Processing document: {} ({})", file_name, mime_type);
+                if mime_type.starts_with("text/") || file_name.ends_with(".txt") 
+                    || file_name.ends_with(".md") || file_name.ends_with(".json") 
+                    || file_name.ends_with(".csv") 
+                {
+                    match self.download_telegram_file(&file_id).await {
+                        Some(bytes) => {
+                            match String::from_utf8(bytes) {
+                                Ok(content) => {
+                                    let truncated = if content.len() > 10000 {
+                                        let safe_end = content.char_indices()
+                                            .take_while(|(idx, _)| *idx < 10000)
+                                            .last()
+                                            .map(|(idx, c)| idx + c.len_utf8())
+                                            .unwrap_or(0);
+                                        format!("{}...\n[truncated, {} chars total]", 
+                                            &content[..safe_end], content.len())
+                                    } else { 
+                                        content 
+                                    };
+                                    format!("[Document: {}]\n{}", file_name, truncated)
+                                }
+                                Err(_) => format!("[Document: {} - binary content]", file_name)
+                            }
+                        }
+                        None => format!("[Document: {} - download failed]", file_name)
+                    }
+                } else {
+                    let caption_part = caption.map(|c| format!(" with caption: \"{}\"", c)).unwrap_or_default();
+                    format!("[Document attached: {} ({}){}]", file_name, mime_type, caption_part)
+                }
+            }
+            
+            IncomingAttachment::Photo { file_id: _ } => {
+                tracing::info!("Processing photo");
+                let caption_part = caption.map(|c| format!(" \"{}\"", c)).unwrap_or_default();
+                format!("[Photo attached]{}", caption_part)
+            }
+            
+            IncomingAttachment::Video { file_id: _, duration } => {
+                tracing::info!("Processing video: duration={}s", duration);
+                let caption_part = caption.map(|c| format!(" \"{}\"", c)).unwrap_or_default();
+                format!("[Video attached, {}s]{}", duration, caption_part)
+            }
+        }
+    }
+
+
+    /// Try to parse a message with attachments (voice, document, photo, video, audio).
+    /// Returns a ChannelMessage with the attachment processed into text.
+    async fn try_parse_attachment_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
+        let message = update.get("message")?;
+        
+        // Check for incoming attachment
+        let attachment = Self::extract_incoming_attachment(message)?;
+        
+        // Extract user info
+        let username = message
+            .get("from")
+            .and_then(|from| from.get("username"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+
+        let sender_id = message
+            .get("from")
+            .and_then(|from| from.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+
+        let sender_identity = if username == "unknown" {
+            sender_id.clone().unwrap_or_else(|| "unknown".to_string())
+        } else {
+            username.clone()
+        };
+
+        // Check authorization
+        let mut identities = vec![username.as_str()];
+        if let Some(id) = sender_id.as_deref() {
+            identities.push(id);
+        }
+
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            return None;
+        }
+
+        // Get chat info
+        let chat_id = message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())?;
+
+        let message_id = message
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+
+        let reply_target = if let Some(tid) = thread_id {
+            format!("{}:{}", chat_id, tid)
+        } else {
+            chat_id.clone()
+        };
+
+        // Get caption if present
+        let caption = Self::get_message_caption(message);
+
+        // Process the attachment
+        let content = self.process_incoming_attachment(attachment, caption).await;
+
+        Some(ChannelMessage {
+            id: format!("telegram_{chat_id}_{message_id}"),
+            sender: sender_identity,
+            reply_target,
+            content,
+            channel: "telegram".to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: None,
+        })
     }
 
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
@@ -1777,6 +2202,27 @@ Ensure only one `zeroclaw` process is using this bot token."
                         offset = uid + 1;
                     }
 
+                    // First, try to handle attachments (voice, document, photo, video, audio)
+                    if let Some(msg) = self.try_parse_attachment_message(update).await {
+                        // Send "typing" indicator immediately when we receive a message
+                        let typing_body = serde_json::json!({
+                            "chat_id": &msg.reply_target,
+                            "action": "typing"
+                        });
+                        let _ = self
+                            .http_client()
+                            .post(self.api_url("sendChatAction"))
+                            .json(&typing_body)
+                            .send()
+                            .await; // Ignore errors for typing indicator
+
+                        if tx.send(msg).await.is_err() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+
+                    // Then, try regular text message parsing
                     let Some(msg) = self.parse_update_message(update) else {
                         self.handle_unauthorized_message(update).await;
                         continue;
@@ -1800,6 +2246,7 @@ Ensure only one `zeroclaw` process is using this bot token."
             }
         }
     }
+
 
     async fn health_check(&self) -> bool {
         let timeout_duration = Duration::from_secs(5);
@@ -2126,6 +2573,31 @@ mod tests {
             infer_attachment_kind_from_target("https://example.com/files/specs.pdf?download=1"),
             Some(TelegramAttachmentKind::Document)
         );
+    }
+
+    #[test]
+    fn infer_audio_content_type_by_extension() {
+        assert_eq!(
+            infer_audio_content_type(Some("voice.ogg"), "audio/wav"),
+            "audio/ogg"
+        );
+        assert_eq!(
+            infer_audio_content_type(Some("music.mp3"), "audio/wav"),
+            "audio/mpeg"
+        );
+        assert_eq!(
+            infer_audio_content_type(Some("recording.flac"), "audio/wav"),
+            "audio/flac"
+        );
+    }
+
+    #[test]
+    fn infer_audio_content_type_uses_fallback_for_unknown_extension() {
+        assert_eq!(
+            infer_audio_content_type(Some("blob.bin"), "audio/wav"),
+            "audio/wav"
+        );
+        assert_eq!(infer_audio_content_type(None, "audio/ogg"), "audio/ogg");
     }
 
     #[test]
